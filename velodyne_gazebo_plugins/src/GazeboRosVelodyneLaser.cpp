@@ -1,7 +1,7 @@
 /*********************************************************************
  * Software License Agreement (BSD License)
  *
- *  Copyright (c) 2015-2018, Dataspeed Inc.
+ *  Copyright (c) 2015-2021, Dataspeed Inc.
  *  All rights reserved.
  *
  *  Redistribution and use in source and binary forms, with or without
@@ -54,6 +54,8 @@
 
 #include <tf/tf.h>
 
+static_assert(GAZEBO_MAJOR_VERSION > 2, "Gazebo version is too old");
+
 #if GAZEBO_GPU_RAY
 #define RaySensor GpuRaySensor
 #define STR_Gpu  "Gpu"
@@ -70,7 +72,7 @@ GZ_REGISTER_SENSOR_PLUGIN(GazeboRosVelodyneLaser)
 
 ////////////////////////////////////////////////////////////////////////////////
 // Constructor
-GazeboRosVelodyneLaser::GazeboRosVelodyneLaser() : nh_(NULL), gaussian_noise_(0), min_range_(0), max_range_(0), publish_static_(false)
+GazeboRosVelodyneLaser::GazeboRosVelodyneLaser() : nh_(NULL), gaussian_noise_(0), min_range_(0), max_range_(0)
 {
 }
 
@@ -121,6 +123,13 @@ void GazeboRosVelodyneLaser::Load(sensors::SensorPtr _parent, sdf::ElementPtr _s
     frame_name_ = "/world";
   } else {
     frame_name_ = _sdf->GetElement("frameName")->Get<std::string>();
+  }
+
+  if (!_sdf->HasElement("organize_cloud")) {
+    ROS_INFO("Velodyne laser plugin missing <organize_cloud>, defaults to false");
+    organize_cloud_ = false;
+  } else {
+    organize_cloud_ = _sdf->GetElement("organize_cloud")->Get<bool>();
   }
 
   if (!_sdf->HasElement("min_range")) {
@@ -187,25 +196,6 @@ void GazeboRosVelodyneLaser::Load(sensors::SensorPtr _parent, sdf::ElementPtr _s
     pub_ = nh_->advertise(ao);
   }
 
-  // Advertise static publisher
-  if (_sdf->HasElement("staticTopicName") && _sdf->HasElement("staticFrameName"))
-  {
-    publish_static_ = true;
-    static_frame_name_ = _sdf->GetElement("staticFrameName")->Get<std::string>();
-    static_topic_name_ = _sdf->GetElement("staticTopicName")->Get<std::string>();
-
-    boost::trim_right_if(prefix, boost::is_any_of("/"));
-    static_frame_name_ = tf::resolve(prefix, static_frame_name_);
-
-    ros::AdvertiseOptions ao = ros::AdvertiseOptions::create<sensor_msgs::PointCloud2>(
-        static_topic_name_, 1,
-        boost::bind(&GazeboRosVelodyneLaser::ConnectCbStatic, this),
-        boost::bind(&GazeboRosVelodyneLaser::ConnectCbStatic, this),
-        ros::VoidPtr(), &laser_queue_);
-
-    pub_static_ = nh_->advertise(ao);
-  }
-
   // Sensor generation off by default
   parent_ray_sensor_->SetActive(false);
 
@@ -244,34 +234,9 @@ void GazeboRosVelodyneLaser::ConnectCb()
   }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Subscribe on-demand
-void GazeboRosVelodyneLaser::ConnectCbStatic()
+void GazeboRosVelodyneLaser::OnScan(ConstLaserScanStampedPtr& _msg)
 {
-  boost::lock_guard<boost::mutex> lock(lock_);
-  if (pub_static_.getNumSubscribers()) {
-    if (!sub_static_) {
 #if GAZEBO_MAJOR_VERSION >= 7
-      sub_static_ = gazebo_node_->Subscribe(this->parent_ray_sensor_->Topic(), &GazeboRosVelodyneLaser::OnScanStatic, this);
-#else
-      sub_static_ = gazebo_node_->Subscribe(this->parent_ray_sensor_->GetTopic(), &GazeboRosVelodyneLaser::OnScanStatic, this);
-#endif
-    }
-    parent_ray_sensor_->SetActive(true);
-  } else {
-#if GAZEBO_MAJOR_VERSION >= 7
-    if (sub_static_) {
-      sub_static_->Unsubscribe();
-      sub_static_.reset();
-    }
-#endif
-    parent_ray_sensor_->SetActive(false);
-  }
-}
-
-sensor_msgs::PointCloud2 GazeboRosVelodyneLaser::Getcloud(ConstLaserScanStampedPtr& _msg)
-{
-  #if GAZEBO_MAJOR_VERSION >= 7
   const ignition::math::Angle maxAngle = parent_ray_sensor_->AngleMax();
   const ignition::math::Angle minAngle = parent_ray_sensor_->AngleMin();
 
@@ -311,11 +276,11 @@ sensor_msgs::PointCloud2 GazeboRosVelodyneLaser::Getcloud(ConstLaserScanStampedP
   const double MIN_INTENSITY = min_intensity_;
 
   // Populate message fields
-  const uint32_t POINT_STEP = 32;
+  const uint32_t POINT_STEP = 22;
   sensor_msgs::PointCloud2 msg;
   msg.header.frame_id = frame_name_;
-  msg.header.stamp = ros::Time::now(); // (_msg->time().sec(), _msg->time().nsec());
-  msg.fields.resize(5);
+  msg.header.stamp = ros::Time(_msg->time().sec(), _msg->time().nsec());
+  msg.fields.resize(6);
   msg.fields[0].name = "x";
   msg.fields[0].offset = 0;
   msg.fields[0].datatype = sensor_msgs::PointField::FLOAT32;
@@ -329,13 +294,17 @@ sensor_msgs::PointCloud2 GazeboRosVelodyneLaser::Getcloud(ConstLaserScanStampedP
   msg.fields[2].datatype = sensor_msgs::PointField::FLOAT32;
   msg.fields[2].count = 1;
   msg.fields[3].name = "intensity";
-  msg.fields[3].offset = 16;
+  msg.fields[3].offset = 12;
   msg.fields[3].datatype = sensor_msgs::PointField::FLOAT32;
   msg.fields[3].count = 1;
   msg.fields[4].name = "ring";
-  msg.fields[4].offset = 20;
+  msg.fields[4].offset = 16;
   msg.fields[4].datatype = sensor_msgs::PointField::UINT16;
   msg.fields[4].count = 1;
+  msg.fields[5].name = "time";
+  msg.fields[5].offset = 18;
+  msg.fields[5].datatype = sensor_msgs::PointField::FLOAT32;
+  msg.fields[5].count = 1;
   msg.data.resize(verticalRangeCount * rangeCount * POINT_STEP);
 
   int i, j;
@@ -350,7 +319,9 @@ sensor_msgs::PointCloud2 GazeboRosVelodyneLaser::Getcloud(ConstLaserScanStampedP
       // Ignore points that lay outside range bands or optionally, beneath a
       // minimum intensity level.
       if ((MIN_RANGE >= r) || (r >= MAX_RANGE) || (intensity < MIN_INTENSITY) ) {
-        continue;
+        if (!organize_cloud_) {
+          continue;
+        }
       }
 
       // Noise
@@ -376,61 +347,43 @@ sensor_msgs::PointCloud2 GazeboRosVelodyneLaser::Getcloud(ConstLaserScanStampedP
 
       // pAngle is rotated by yAngle:
       if ((MIN_RANGE < r) && (r < MAX_RANGE)) {
-        *((float*)(ptr + 0)) = r * cos(pAngle) * cos(yAngle);
-        *((float*)(ptr + 4)) = r * cos(pAngle) * sin(yAngle);
-#if GAZEBO_MAJOR_VERSION > 2
-        *((float*)(ptr + 8)) = r * sin(pAngle);
-#else
-        *((float*)(ptr + 8)) = -r * sin(pAngle);
-#endif
-        *((float*)(ptr + 16)) = intensity;
-#if GAZEBO_MAJOR_VERSION > 2
-        *((uint16_t*)(ptr + 20)) = j; // ring
-#else
-        *((uint16_t*)(ptr + 20)) = verticalRangeCount - 1 - j; // ring
-#endif
+        *((float*)(ptr + 0)) = r * cos(pAngle) * cos(yAngle); // x
+        *((float*)(ptr + 4)) = r * cos(pAngle) * sin(yAngle); // y
+        *((float*)(ptr + 8)) = r * sin(pAngle); // z
+        *((float*)(ptr + 12)) = intensity; // intensity
+        *((uint16_t*)(ptr + 16)) = j; // ring
+        *((float*)(ptr + 18)) = 0.0; // time
+        ptr += POINT_STEP;
+      } else if (organize_cloud_) {
+        *((float*)(ptr + 0)) = nanf(""); // x
+        *((float*)(ptr + 4)) = nanf(""); // y
+        *((float*)(ptr + 8)) = nanf(""); // x
+        *((float*)(ptr + 12)) = nanf(""); // intensity
+        *((uint16_t*)(ptr + 16)) = j; // ring
+        *((float*)(ptr + 18)) = 0.0; // time
         ptr += POINT_STEP;
       }
     }
   }
 
   // Populate message with number of valid points
+  msg.data.resize(ptr - msg.data.data()); // Shrink to actual size
   msg.point_step = POINT_STEP;
-  msg.row_step = ptr - msg.data.data();
-  msg.height = 1;
-  msg.width = msg.row_step / POINT_STEP;
   msg.is_bigendian = false;
-  msg.is_dense = true;
-  msg.data.resize(msg.row_step); // Shrink to actual size
-  return msg;
-}
+  if (organize_cloud_) {
+    msg.width = verticalRangeCount;
+    msg.height = msg.data.size() / POINT_STEP / msg.width;
+    msg.row_step = POINT_STEP * msg.width;
+    msg.is_dense = false;
+  } else {
+    msg.width = msg.data.size() / POINT_STEP;
+    msg.height = 1;
+    msg.row_step = msg.data.size();
+    msg.is_dense = true;
+  }
 
-void GazeboRosVelodyneLaser::OnScan(ConstLaserScanStampedPtr& _msg)
-{
   // Publish output
-  pub_.publish(Getcloud(_msg));
-}
-
-void GazeboRosVelodyneLaser::OnScanStatic(ConstLaserScanStampedPtr& _msg)
-{
-  if (!publish_static_)
-  {
-    return;
-  }
-
-  tf::StampedTransform transformStamped;
-  try
-  {
-    auto msg = Getcloud(_msg);
-    sensor_msgs::PointCloud2 cloud_out;
-    pcl_ros::transformPointCloud(static_frame_name_, msg, cloud_out, tf_listener_);
-    pub_static_.publish(cloud_out);
-  }
-  catch(tf2::TransformException &ex)
-  {
-    ROS_WARN("%s", ex.what());
-  }
-  
+  pub_.publish(msg);
 }
 
 // Custom Callback Queue
